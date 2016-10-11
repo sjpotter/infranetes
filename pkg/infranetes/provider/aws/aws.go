@@ -22,16 +22,8 @@ import (
 )
 
 type podData struct {
+	common.PodData
 	vm                 *aws.VM
-	metadata           *kubeapi.PodSandboxMetadata
-	annotations        map[string]string
-	createdAt          int64
-	ip                 string
-	labels             map[string]string
-	linux              *kubeapi.LinuxPodSandboxConfig
-	stateLock          sync.Mutex
-	client             *common.Client
-	podState           kubeapi.PodSandBoxState
 	vmState            string
 	vmStateLastChecked time.Time
 }
@@ -145,22 +137,24 @@ func (v *awsProvider) RunPodSandbox(req *kubeapi.RunPodSandboxRequest) (*kubeapi
 	}
 
 	v.vmMapLock.Lock()
+	defer v.vmMapLock.Unlock()
 
 	v.vmMap[name] = &podData{
+		PodData: common.PodData{
+			Id:          &name,
+			Metadata:    req.Config.Metadata,
+			Annotations: req.Config.Annotations,
+			CreatedAt:   time.Now().Unix(),
+			Ip:          ip,
+			Labels:      req.Config.Labels,
+			Linux:       req.Config.Linux,
+			Client:      client,
+			PodState:    kubeapi.PodSandBoxState_READY,
+		},
 		vm:                 vm,
-		metadata:           req.Config.Metadata,
-		annotations:        req.Config.Annotations,
-		createdAt:          time.Now().Unix(),
-		ip:                 ip,
-		labels:             req.Config.Labels,
-		linux:              req.Config.Linux,
-		client:             client,
-		podState:           kubeapi.PodSandBoxState_READY,
 		vmState:            lvm.VMRunning,
 		vmStateLastChecked: time.Now(),
 	}
-
-	v.vmMapLock.Unlock()
 
 	resp := &kubeapi.RunPodSandboxResponse{
 		PodSandboxId: &name,
@@ -175,12 +169,10 @@ func (v *awsProvider) StopPodSandbox(req *kubeapi.StopPodSandboxRequest) (*kubea
 		return nil, fmt.Errorf("StopPodSandbox: %v", err)
 	}
 
-	podData.stateLock.Lock()
-	podData.podState = kubeapi.PodSandBoxState_NOTREADY
-	podData.stateLock.Unlock()
+	err = podData.StopPod()
 
 	resp := &kubeapi.StopPodSandboxResponse{}
-	return resp, nil
+	return resp, err
 }
 
 func (v *awsProvider) RemovePodSandbox(req *kubeapi.RemovePodSandboxRequest) (*kubeapi.RemovePodSandboxResponse, error) {
@@ -193,18 +185,18 @@ func (v *awsProvider) RemovePodSandbox(req *kubeapi.RemovePodSandboxRequest) (*k
 		return nil, fmt.Errorf("RemovePodSandbox: %v", err)
 	}
 
-	podData.client.Close()
+	err = podData.RemovePod()
 
 	v.vmMapLock.Lock()
 	delete(v.vmMap, req.GetPodSandboxId())
 	v.vmMapLock.Unlock()
 
 	resp := &kubeapi.RemovePodSandboxResponse{}
-	return resp, nil
+	return resp, err
 }
 
 func updateVMState(podData *podData) string {
-	podData.stateLock.Lock()
+	podData.StateLock.Lock()
 
 	ret := podData.vmState
 
@@ -217,7 +209,7 @@ func updateVMState(podData *podData) string {
 		}
 	}
 
-	podData.stateLock.Unlock()
+	podData.StateLock.Unlock()
 
 	return ret
 }
@@ -228,37 +220,22 @@ func (v *awsProvider) PodSandboxStatus(req *kubeapi.PodSandboxStatusRequest) (*k
 		return nil, fmt.Errorf("PodSandboxStatus: %v", err)
 	}
 
-	network := &kubeapi.PodSandboxNetworkStatus{
-		Ip: &podData.ip,
+	podData.StateLock.Lock()
+	defer podData.StateLock.Unlock()
+
+	status, err := podData.PodStatus()
+	if err != nil {
+		return nil, fmt.Errorf("PodSandboxStatus: %v", err)
 	}
 
 	vmState := updateVMState(podData)
 
-	state := podData.podState
+	state := podData.PodState
 	if vmState != lvm.VMRunning {
 		state = kubeapi.PodSandBoxState_NOTREADY
 	}
 
-	id := req.GetPodSandboxId()
-
-	net := "host"
-	linux := &kubeapi.LinuxPodSandboxStatus{
-		Namespaces: &kubeapi.Namespace{
-			Network: &net,
-			Options: podData.linux.NamespaceOptions,
-		},
-	}
-
-	status := &kubeapi.PodSandboxStatus{
-		Id:          &id,
-		CreatedAt:   &podData.createdAt,
-		Metadata:    podData.metadata,
-		Network:     network,
-		State:       &state,
-		Linux:       linux,
-		Labels:      podData.labels,
-		Annotations: podData.annotations,
-	}
+	status.State = &state
 
 	resp := &kubeapi.PodSandboxStatusResponse{
 		Status: status,
@@ -284,7 +261,7 @@ func (v *awsProvider) ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kubea
 			continue
 		}
 
-		podState := podData.podState
+		podState := podData.PodState
 		if vmState != lvm.VMRunning {
 			podState = kubeapi.PodSandBoxState_NOTREADY
 		}
@@ -302,20 +279,14 @@ func (v *awsProvider) ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kubea
 
 			filterLabels := req.Filter.GetLabelSelector()
 
-			if filter, msg := filterByLabels(filterLabels, podData.labels); filter {
+			if filter, msg := podData.FilterByLabels(filterLabels); filter {
 				glog.V(1).Infof("ListPodSandbox: filtering out %v on labels as %v", id, msg)
 				continue
 			}
 		}
 
-		sandbox := &kubeapi.PodSandbox{
-			CreatedAt:   &podData.createdAt,
-			Id:          &id,
-			Metadata:    podData.metadata,
-			Labels:      podData.labels,
-			Annotations: podData.annotations,
-			State:       &podState,
-		}
+		sandbox := podData.GetSandbox()
+		sandbox.State = &podState
 
 		glog.V(1).Infof("ListPodSandbox Appending a sandbox for %v to sandboxes", id)
 
@@ -331,28 +302,8 @@ func (v *awsProvider) ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kubea
 	return resp, nil
 }
 
-func filterByLabels(filterLabels map[string]string, podLabels map[string]string) (bool, string) {
-	for key, filterVal := range filterLabels {
-		if podVal, ok := podLabels[key]; !ok {
-			return true, fmt.Sprintf("didn't find key %v in local labels: %+v", key, podLabels)
-		} else {
-			if podVal != filterVal {
-				return true, fmt.Sprintf("key value's didn't match %v and %v", filterVal, podVal)
-			}
-		}
-	}
-
-	return false, ""
-}
-
 func (v *awsProvider) GetIP(podName string) (string, error) {
-	podData, err := v.getPodData(podName)
 
-	if err != nil {
-		return "", fmt.Errorf("%v unknown pod name", podName)
-	}
-
-	return podData.ip, nil
 }
 
 func (v *awsProvider) GetClient(podName string) (*common.Client, error) {
@@ -362,12 +313,15 @@ func (v *awsProvider) GetClient(podName string) (*common.Client, error) {
 		return nil, fmt.Errorf("%v unknown pod name", podName)
 	}
 
-	return podData.client, nil
+	return podData.Client, nil
 }
 
 func (v *awsProvider) GetVMList() []string {
-	ret := []string{}
 	v.vmMapLock.Lock()
+	defer v.vmMapLock.Unlock()
+
+	ret := []string{}
+
 	for name := range v.vmMap {
 		ret = append(ret, name)
 	}
