@@ -13,6 +13,7 @@ import (
 	lvm "github.com/apcera/libretto/virtualmachine"
 	"github.com/apcera/libretto/virtualmachine/virtualbox"
 	"github.com/sjpotter/infranetes/pkg/infranetes/provider/common"
+	"sync"
 )
 
 type podData struct {
@@ -22,6 +23,8 @@ type podData struct {
 	createdAt   int64
 	ip          string
 	client      *common.Client
+	stateLock   sync.Mutex
+	podState    kubeapi.PodSandBoxState
 }
 
 type vboxProvider struct {
@@ -100,6 +103,7 @@ func (v *vboxProvider) RunPodSandbox(req *kubeapi.RunPodSandboxRequest) (*kubeap
 		createdAt:   time.Now().Unix(),
 		ip:          ips[0].String(),
 		client:      client,
+		podState:    kubeapi.PodSandBoxState_READY,
 	}
 
 	resp := &kubeapi.RunPodSandboxResponse{
@@ -115,9 +119,9 @@ func (v *vboxProvider) StopPodSandbox(req *kubeapi.StopPodSandboxRequest) (*kube
 		return nil, fmt.Errorf("StopPodSandbox: %v", err)
 	}
 
-	if err := podData.vm.Halt(); err != nil {
-		return nil, fmt.Errorf("StopPodSandbox: %v", err)
-	}
+	podData.stateLock.Lock()
+	podData.podState = kubeapi.PodSandBoxState_NOTREADY
+	podData.stateLock.Unlock()
 
 	resp := &kubeapi.StopPodSandboxResponse{}
 	return resp, nil
@@ -145,6 +149,9 @@ func (v *vboxProvider) PodSandboxStatus(req *kubeapi.PodSandboxStatusRequest) (*
 		return nil, fmt.Errorf("PodSandboxStatus: %v", err)
 	}
 
+	podData.stateLock.Lock()
+	defer podData.stateLock.Unlock()
+
 	network := &kubeapi.PodSandboxNetworkStatus{
 		Ip: &podData.ip,
 	}
@@ -154,7 +161,7 @@ func (v *vboxProvider) PodSandboxStatus(req *kubeapi.PodSandboxStatusRequest) (*
 		return nil, fmt.Errorf("PodSandboxStatus: error in GetState(): %v", err)
 	}
 
-	state := kubeapi.PodSandBoxState_READY
+	state := podData.podState
 	if vmState != lvm.VMRunning {
 		state = kubeapi.PodSandBoxState_NOTREADY
 	}
