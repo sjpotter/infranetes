@@ -223,19 +223,12 @@ func (v *awsProvider) PodSandboxStatus(req *kubeapi.PodSandboxStatusRequest) (*k
 	podData.StateLock.Lock()
 	defer podData.StateLock.Unlock()
 
-	status, err := podData.PodStatus()
-	if err != nil {
-		return nil, fmt.Errorf("PodSandboxStatus: %v", err)
-	}
-
 	vmState := updateVMState(podData)
-
-	state := podData.PodState
 	if vmState != lvm.VMRunning {
-		state = kubeapi.PodSandBoxState_NOTREADY
+		podData.PodState = kubeapi.PodSandBoxState_NOTREADY
 	}
 
-	status.State = &state
+	status := podData.PodStatus()
 
 	resp := &kubeapi.PodSandboxStatusResponse{
 		Status: status,
@@ -253,40 +246,23 @@ func (v *awsProvider) ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kubea
 	glog.V(1).Infof("ListPodSandbox: len of vmMap = %v", len(v.vmMap))
 
 	for id, podData := range v.vmMap {
+		podData.StateLock.Lock()
 		glog.V(1).Infof("ListPodSandbox:v podData for %v = %+v", id, podData)
-		vmState := updateVMState(podData)
 
-		if vmState == "terminated" || vmState == "shutting-down" {
-			glog.V(1).Infof("ListPodSandbox: filtering out %v because the vm is no longer available", id)
+		vmState := updateVMState(podData)
+		if vmState != lvm.VMRunning {
+			podData.PodState = kubeapi.PodSandBoxState_NOTREADY
+		}
+
+		if filter, msg := podData.Filter(req.Filter); filter {
+			glog.V(1).Infof("ListPodSandbox: filtering out %v on labels as %v", id, msg)
+			podData.StateLock.Unlock()
 			continue
 		}
 
-		podState := podData.PodState
-		if vmState != lvm.VMRunning {
-			podState = kubeapi.PodSandBoxState_NOTREADY
-		}
-
-		if req.Filter != nil {
-			if req.Filter.GetId() != "" && req.Filter.GetId() != id {
-				glog.V(1).Infof("ListPodSandbox: filtering out %v because doesn't match %v", id, req.Filter.GetId())
-				continue
-			}
-
-			if req.Filter.GetState() != podState {
-				glog.V(1).Infof("ListPodSandbox: filtering out %v because want %v and got %v", id, req.Filter.GetState(), podState)
-				continue
-			}
-
-			filterLabels := req.Filter.GetLabelSelector()
-
-			if filter, msg := podData.FilterByLabels(filterLabels); filter {
-				glog.V(1).Infof("ListPodSandbox: filtering out %v on labels as %v", id, msg)
-				continue
-			}
-		}
-
 		sandbox := podData.GetSandbox()
-		sandbox.State = &podState
+
+		podData.StateLock.Unlock()
 
 		glog.V(1).Infof("ListPodSandbox Appending a sandbox for %v to sandboxes", id)
 
@@ -303,7 +279,13 @@ func (v *awsProvider) ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kubea
 }
 
 func (v *awsProvider) GetIP(podName string) (string, error) {
+	podData, err := v.getPodData(podName)
 
+	if err != nil {
+		return "", fmt.Errorf("%v unknown pod name", podName)
+	}
+
+	return podData.Ip, nil
 }
 
 func (v *awsProvider) GetClient(podName string) (*common.Client, error) {

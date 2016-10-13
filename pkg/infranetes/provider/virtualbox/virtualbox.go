@@ -162,22 +162,15 @@ func (v *vboxProvider) PodSandboxStatus(req *kubeapi.PodSandboxStatusRequest) (*
 	podData.StateLock.Lock()
 	defer podData.StateLock.Unlock()
 
-	status, err := podData.PodStatus()
-	if err != nil {
-		return nil, fmt.Errorf("PodSandboxStatus: %v", err)
-	}
-
 	vmState, err := podData.vm.GetState()
 	if err != nil {
 		return nil, fmt.Errorf("PodSandboxStatus: error in GetState(): %v", err)
 	}
-
-	state := podData.PodState
 	if vmState != lvm.VMRunning {
-		state = kubeapi.PodSandBoxState_NOTREADY
+		podData.PodState = kubeapi.PodSandBoxState_NOTREADY
 	}
 
-	status.State = &state
+	status := podData.PodStatus()
 
 	resp := &kubeapi.PodSandboxStatusResponse{
 		Status: status,
@@ -195,38 +188,24 @@ func (v *vboxProvider) ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kube
 	glog.V(1).Infof("ListPodSandbox: len of vmMap = %v", len(v.vmMap))
 
 	for id, podData := range v.vmMap {
+		podData.StateLock.Lock()
 		glog.V(1).Infof("ListPodSandbox:v podData for %v = %+v", id, podData)
 		vmState, err := podData.vm.GetState()
 		if err != nil {
 			continue
 		}
-
-		podState := podData.PodState
 		if vmState != lvm.VMRunning {
-			podState = kubeapi.PodSandBoxState_NOTREADY
+			podData.PodState = kubeapi.PodSandBoxState_NOTREADY
 		}
 
-		if req.Filter != nil {
-			if req.Filter.GetId() != "" && req.Filter.GetId() != id {
-				glog.V(1).Infof("ListPodSandbox: filtering out %v because doesn't match %v", id, req.Filter.GetId())
-				continue
-			}
-
-			if req.Filter.GetState() != podState {
-				glog.V(1).Infof("ListPodSandbox: filtering out %v because want %v and got %v", id, req.Filter.GetState(), podState)
-				continue
-			}
-
-			filterLabels := req.Filter.GetLabelSelector()
-
-			if filter, msg := podData.FilterByLabels(filterLabels); filter {
-				glog.V(1).Infof("ListPodSandbox: filtering out %v on labels as %v", id, msg)
-				continue
-			}
+		if filter, msg := podData.Filter(req.Filter); filter {
+			glog.V(1).Infof("ListPodSandbox: filtering out %v on labels as %v", id, msg)
+			podData.StateLock.Unlock()
+			continue
 		}
 
 		sandbox := podData.GetSandbox()
-		sandbox.State = &podState
+		podData.StateLock.Unlock()
 
 		glog.V(1).Infof("ListPodSandbox Appending a sandbox for %v to sandboxes", id)
 
