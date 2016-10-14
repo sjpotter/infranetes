@@ -9,14 +9,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
+	"github.com/sjpotter/infranetes/pkg/infranetes/provider"
+	"github.com/sjpotter/infranetes/pkg/infranetes/provider/common"
 
 	"github.com/apcera/libretto/ssh"
 	lvm "github.com/apcera/libretto/virtualmachine"
 	"github.com/apcera/libretto/virtualmachine/aws"
-
-	"github.com/sjpotter/infranetes/pkg/infranetes/provider"
-	"github.com/sjpotter/infranetes/pkg/infranetes/provider/common"
+	"github.com/golang/glog"
 
 	kubeapi "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
 )
@@ -30,7 +29,7 @@ type podData struct {
 
 type awsProvider struct {
 	vmMap     map[string]*podData
-	vmMapLock sync.Mutex
+	vmMapLock sync.RWMutex
 	config    *awsConfig
 }
 
@@ -72,10 +71,8 @@ func NewAWSProvider() (provider.PodProvider, error) {
 	}, nil
 }
 
+/* Must be at least holding the vmmap RLock */
 func (v *awsProvider) getPodData(id string) (*podData, error) {
-	v.vmMapLock.Lock()
-	defer v.vmMapLock.Unlock()
-
 	podData, ok := v.vmMap[id]
 	if !ok {
 		return nil, fmt.Errorf("Invalid PodSandboxId (%v)", id)
@@ -164,10 +161,16 @@ func (v *awsProvider) RunPodSandbox(req *kubeapi.RunPodSandboxRequest) (*kubeapi
 }
 
 func (v *awsProvider) StopPodSandbox(req *kubeapi.StopPodSandboxRequest) (*kubeapi.StopPodSandboxResponse, error) {
+	v.vmMapLock.RLock()
+	defer v.vmMapLock.RUnlock()
+
 	podData, err := v.getPodData(req.GetPodSandboxId())
 	if err != nil {
 		return nil, fmt.Errorf("StopPodSandbox: %v", err)
 	}
+
+	podData.StateLock.Lock()
+	defer podData.StateLock.Unlock()
 
 	err = podData.StopPod()
 
@@ -176,10 +179,16 @@ func (v *awsProvider) StopPodSandbox(req *kubeapi.StopPodSandboxRequest) (*kubea
 }
 
 func (v *awsProvider) RemovePodSandbox(req *kubeapi.RemovePodSandboxRequest) (*kubeapi.RemovePodSandboxResponse, error) {
+	v.vmMapLock.Lock()
+	defer v.vmMapLock.Unlock()
+
 	podData, err := v.getPodData(req.GetPodSandboxId())
 	if err != nil {
 		return nil, fmt.Errorf("RemovePodSandbox: %v", err)
 	}
+
+	podData.StateLock.Lock()
+	defer podData.StateLock.Unlock()
 
 	if err := podData.vm.Destroy(); err != nil {
 		return nil, fmt.Errorf("RemovePodSandbox: %v", err)
@@ -187,17 +196,13 @@ func (v *awsProvider) RemovePodSandbox(req *kubeapi.RemovePodSandboxRequest) (*k
 
 	err = podData.RemovePod()
 
-	v.vmMapLock.Lock()
 	delete(v.vmMap, req.GetPodSandboxId())
-	v.vmMapLock.Unlock()
 
 	resp := &kubeapi.RemovePodSandboxResponse{}
 	return resp, err
 }
 
 func updateVMState(podData *podData) string {
-	podData.StateLock.Lock()
-
 	ret := podData.vmState
 
 	if time.Now().After(podData.vmStateLastChecked.Add(30 * time.Second)) {
@@ -209,12 +214,13 @@ func updateVMState(podData *podData) string {
 		}
 	}
 
-	podData.StateLock.Unlock()
-
 	return ret
 }
 
 func (v *awsProvider) PodSandboxStatus(req *kubeapi.PodSandboxStatusRequest) (*kubeapi.PodSandboxStatusResponse, error) {
+	v.vmMapLock.RLock()
+	defer v.vmMapLock.RUnlock()
+
 	podData, err := v.getPodData(req.GetPodSandboxId())
 	if err != nil {
 		return nil, fmt.Errorf("PodSandboxStatus: %v", err)
@@ -238,35 +244,19 @@ func (v *awsProvider) PodSandboxStatus(req *kubeapi.PodSandboxStatusRequest) (*k
 }
 
 func (v *awsProvider) ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kubeapi.ListPodSandboxResponse, error) {
-	sandboxes := []*kubeapi.PodSandbox{}
+	v.vmMapLock.RLock()
+	defer v.vmMapLock.RUnlock()
 
-	v.vmMapLock.Lock()
-	defer v.vmMapLock.Unlock()
+	sandboxes := []*kubeapi.PodSandbox{}
 
 	glog.V(1).Infof("ListPodSandbox: len of vmMap = %v", len(v.vmMap))
 
 	for id, podData := range v.vmMap {
-		podData.StateLock.Lock()
-		glog.V(1).Infof("ListPodSandbox:v podData for %v = %+v", id, podData)
-
-		vmState := updateVMState(podData)
-		if vmState != lvm.VMRunning {
-			podData.PodState = kubeapi.PodSandBoxState_NOTREADY
+		// podData lock is taken and released in filter
+		if sandbox, ok := filter(podData, req.Filter); ok {
+			glog.V(1).Infof("ListPodSandbox Appending a sandbox for %v to sandboxes", id)
+			sandboxes = append(sandboxes, sandbox)
 		}
-
-		if filter, msg := podData.Filter(req.Filter); filter {
-			glog.V(1).Infof("ListPodSandbox: filtering out %v on labels as %v", id, msg)
-			podData.StateLock.Unlock()
-			continue
-		}
-
-		sandbox := podData.GetSandbox()
-
-		podData.StateLock.Unlock()
-
-		glog.V(1).Infof("ListPodSandbox Appending a sandbox for %v to sandboxes", id)
-
-		sandboxes = append(sandboxes, sandbox)
 	}
 
 	glog.V(1).Infof("ListPodSandbox: len of sandboxes returning = %v", len(sandboxes))
@@ -278,17 +268,35 @@ func (v *awsProvider) ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kubea
 	return resp, nil
 }
 
-func (v *awsProvider) GetIP(podName string) (string, error) {
-	podData, err := v.getPodData(podName)
+func filter(podData *podData, reqFilter *kubeapi.PodSandboxFilter) (*kubeapi.PodSandbox, bool) {
+	podData.StateLock.Lock()
+	defer podData.StateLock.Unlock()
 
-	if err != nil {
-		return "", fmt.Errorf("%v unknown pod name", podName)
+	glog.V(1).Infof("filter: podData for %v = %+v", *podData.Id, podData)
+
+	vmState := updateVMState(podData)
+	if vmState != lvm.VMRunning {
+		podData.PodState = kubeapi.PodSandBoxState_NOTREADY
 	}
 
-	return podData.Ip, nil
+	if filter, msg := podData.Filter(reqFilter); filter {
+		glog.V(1).Infof("filter: filtering out %v on labels as %v", *podData.Id, msg)
+		return nil, false
+	}
+
+	sandbox := podData.GetSandbox()
+
+	return sandbox, true
 }
 
 func (v *awsProvider) GetClient(podName string) (*common.Client, error) {
+	v.vmMapLock.RLock()
+	defer v.vmMapLock.RUnlock()
+
+	return v.GetClientLocked(podName)
+}
+
+func (v *awsProvider) GetClientLocked(podName string) (*common.Client, error) {
 	podData, err := v.getPodData(podName)
 
 	if err != nil {
@@ -299,15 +307,19 @@ func (v *awsProvider) GetClient(podName string) (*common.Client, error) {
 }
 
 func (v *awsProvider) GetVMList() []string {
-	v.vmMapLock.Lock()
-	defer v.vmMapLock.Unlock()
-
 	ret := []string{}
 
 	for name := range v.vmMap {
 		ret = append(ret, name)
 	}
-	v.vmMapLock.Unlock()
 
 	return ret
+}
+
+func (v *awsProvider) RLockMap() {
+	v.vmMapLock.RLock()
+}
+
+func (v *awsProvider) RUnlockMap() {
+	v.vmMapLock.RUnlock()
 }

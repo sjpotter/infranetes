@@ -20,10 +20,9 @@ type PodData struct {
 	PodState    kubeapi.PodSandBoxState
 }
 
+/* Expect StateLock to already be taken */
 func (p *PodData) StopPod() error {
-	p.StateLock.Lock()
 	p.PodState = kubeapi.PodSandBoxState_NOTREADY
-	p.StateLock.Unlock()
 
 	return nil
 }

@@ -16,8 +16,11 @@ type PodProvider interface {
 	ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kubeapi.ListPodSandboxResponse, error)
 
 	GetVMList() []string
+	RLockMap()
+	RUnlockMap()
 
 	GetClient(podname string) (*common.Client, error)
+	GetClientLocked(podname string) (*common.Client, error)
 }
 
 type ImageProvider interface {

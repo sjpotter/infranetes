@@ -245,13 +245,16 @@ func (m *Manager) ListContainers(ctx context.Context, req *kubeapi.ListContainer
 
 	results := []*kubeapi.Container{}
 
+	m.podProvider.RLockMap()
+	defer m.podProvider.RUnlockMap()
+
 	for _, podId := range m.podProvider.GetVMList() {
 		sandboxId := ""
 		if req.Filter != nil {
 			sandboxId = req.Filter.GetPodSandboxId()
 		}
 		if sandboxId == "" || sandboxId == podId {
-			client, err := m.podProvider.GetClient(podId)
+			client, err := m.podProvider.GetClientLocked(podId)
 			if err != nil {
 				glog.Warningf("ListContainers: couldn't get client for %s: %v", podId, err)
 				continue

@@ -4,17 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"sync"
 	"time"
 
 	"github.com/sjpotter/infranetes/pkg/infranetes/provider"
-
-	kubeapi "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	"github.com/sjpotter/infranetes/pkg/infranetes/provider/common"
 
 	lvm "github.com/apcera/libretto/virtualmachine"
 	"github.com/apcera/libretto/virtualmachine/virtualbox"
 	"github.com/golang/glog"
-	"github.com/sjpotter/infranetes/pkg/infranetes/provider/common"
-	"sync"
+
+	kubeapi "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
 )
 
 type podData struct {
@@ -26,7 +26,7 @@ type vboxProvider struct {
 	netDevice string
 	vmSrc     string
 	vmMap     map[string]*podData
-	vmMapLock sync.Mutex
+	vmMapLock sync.RWMutex
 }
 
 func init() {
@@ -55,10 +55,8 @@ func NewVBoxProvider() (provider.PodProvider, error) {
 	}, nil
 }
 
+/* Must be at least holding the vmmap RLock */
 func (v *vboxProvider) getPodData(id string) (*podData, error) {
-	v.vmMapLock.Lock()
-	defer v.vmMapLock.Unlock()
-
 	podData, ok := v.vmMap[id]
 	if !ok {
 		return nil, fmt.Errorf("Invalid PodSandboxId (%v)", id)
@@ -122,6 +120,9 @@ func (v *vboxProvider) RunPodSandbox(req *kubeapi.RunPodSandboxRequest) (*kubeap
 }
 
 func (v *vboxProvider) StopPodSandbox(req *kubeapi.StopPodSandboxRequest) (*kubeapi.StopPodSandboxResponse, error) {
+	v.vmMapLock.RLock()
+	defer v.vmMapLock.RUnlock()
+
 	podData, err := v.getPodData(req.GetPodSandboxId())
 	if err != nil {
 		return nil, fmt.Errorf("StopPodSandbox: %v", err)
@@ -134,6 +135,9 @@ func (v *vboxProvider) StopPodSandbox(req *kubeapi.StopPodSandboxRequest) (*kube
 }
 
 func (v *vboxProvider) RemovePodSandbox(req *kubeapi.RemovePodSandboxRequest) (*kubeapi.RemovePodSandboxResponse, error) {
+	v.vmMapLock.Lock()
+	defer v.vmMapLock.Unlock()
+
 	podData, err := v.getPodData(req.GetPodSandboxId())
 	if err != nil {
 		return nil, fmt.Errorf("RemovePodSandbox: %v", err)
@@ -154,6 +158,9 @@ func (v *vboxProvider) RemovePodSandbox(req *kubeapi.RemovePodSandboxRequest) (*
 }
 
 func (v *vboxProvider) PodSandboxStatus(req *kubeapi.PodSandboxStatusRequest) (*kubeapi.PodSandboxStatusResponse, error) {
+	v.vmMapLock.RLock()
+	defer v.vmMapLock.RUnlock()
+
 	podData, err := v.getPodData(req.GetPodSandboxId())
 	if err != nil {
 		return nil, fmt.Errorf("PodSandboxStatus: %v", err)
@@ -180,36 +187,18 @@ func (v *vboxProvider) PodSandboxStatus(req *kubeapi.PodSandboxStatusRequest) (*
 }
 
 func (v *vboxProvider) ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kubeapi.ListPodSandboxResponse, error) {
-	sandboxes := []*kubeapi.PodSandbox{}
+	v.vmMapLock.RLock()
+	defer v.vmMapLock.RUnlock()
 
-	v.vmMapLock.Lock()
-	defer v.vmMapLock.Unlock()
+	sandboxes := []*kubeapi.PodSandbox{}
 
 	glog.V(1).Infof("ListPodSandbox: len of vmMap = %v", len(v.vmMap))
 
 	for id, podData := range v.vmMap {
-		podData.StateLock.Lock()
-		glog.V(1).Infof("ListPodSandbox:v podData for %v = %+v", id, podData)
-		vmState, err := podData.vm.GetState()
-		if err != nil {
-			continue
+		if sandbox, ok := filter(podData, req.Filter); ok {
+			glog.V(1).Infof("ListPodSandbox Appending a sandbox for %v to sandboxes", id)
+			sandboxes = append(sandboxes, sandbox)
 		}
-		if vmState != lvm.VMRunning {
-			podData.PodState = kubeapi.PodSandBoxState_NOTREADY
-		}
-
-		if filter, msg := podData.Filter(req.Filter); filter {
-			glog.V(1).Infof("ListPodSandbox: filtering out %v on labels as %v", id, msg)
-			podData.StateLock.Unlock()
-			continue
-		}
-
-		sandbox := podData.GetSandbox()
-		podData.StateLock.Unlock()
-
-		glog.V(1).Infof("ListPodSandbox Appending a sandbox for %v to sandboxes", id)
-
-		sandboxes = append(sandboxes, sandbox)
 	}
 
 	glog.V(1).Infof("ListPodSandbox: len of sandboxes returning = %v", len(sandboxes))
@@ -221,17 +210,38 @@ func (v *vboxProvider) ListPodSandbox(req *kubeapi.ListPodSandboxRequest) (*kube
 	return resp, nil
 }
 
-func (v *vboxProvider) GetIP(podName string) (string, error) {
-	podData, err := v.getPodData(podName)
+func filter(podData *podData, reqFilter *kubeapi.PodSandboxFilter) (*kubeapi.PodSandbox, bool) {
+	podData.StateLock.Lock()
+	defer podData.StateLock.Unlock()
 
+	glog.V(1).Infof("filter: podData for %v = %+v", *podData.Id, podData)
+
+	vmState, err := podData.vm.GetState()
 	if err != nil {
-		return "", fmt.Errorf("%v unknown pod name", podName)
+		return nil, false
+	}
+	if vmState != lvm.VMRunning {
+		podData.PodState = kubeapi.PodSandBoxState_NOTREADY
 	}
 
-	return podData.Ip, nil
+	if filter, msg := podData.Filter(reqFilter); filter {
+		glog.V(1).Infof("filter: filtering out %v on labels as %v", *podData.Id, msg)
+		return nil, false
+	}
+
+	sandbox := podData.GetSandbox()
+
+	return sandbox, true
 }
 
 func (v *vboxProvider) GetClient(podName string) (*common.Client, error) {
+	v.vmMapLock.RLock()
+	defer v.vmMapLock.RUnlock()
+
+	return v.GetClientLocked(podName)
+}
+
+func (v *vboxProvider) GetClientLocked(podName string) (*common.Client, error) {
 	podData, err := v.getPodData(podName)
 
 	if err != nil {
@@ -242,13 +252,18 @@ func (v *vboxProvider) GetClient(podName string) (*common.Client, error) {
 }
 
 func (v *vboxProvider) GetVMList() []string {
-	v.vmMapLock.Lock()
-	defer v.vmMapLock.Unlock()
-
 	ret := []string{}
 	for name := range v.vmMap {
 		ret = append(ret, name)
 	}
 
 	return ret
+}
+
+func (v *vboxProvider) RLockMap() {
+	v.vmMapLock.RLock()
+}
+
+func (v *vboxProvider) RUnlockMap() {
+	v.vmMapLock.RUnlock()
 }
